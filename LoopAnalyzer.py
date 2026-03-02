@@ -364,12 +364,21 @@ class LoopAnalyzer:
 def analyze_loops(loops: List[LoopInfo]) -> List[AnalyzedLoop]:
     """
     批量分析循环列表，返回 AnalyzedLoop 列表。
-    只分析顶层循环（nesting_level == 0）；
-    矩阵模式的内层循环通过 original.inner_loops 由 SVECodeGen 处理。
+    只分析最内层循环（len(inner_loops) == 0）。
     """
+    def _walk(loop: LoopInfo) -> List[LoopInfo]:
+        nodes = [loop]
+        for child in loop.inner_loops:
+            nodes.extend(_walk(child))
+        return nodes
+
     analyzer = LoopAnalyzer()
     results: List[AnalyzedLoop] = []
-    for loop in loops:
-        if loop.nesting_level == 0:
+    all_loops: List[LoopInfo] = []
+    for root in loops:
+        all_loops.extend(_walk(root))
+
+    for loop in all_loops:
+        if not loop.inner_loops:
             results.append(analyzer.analyze(loop))
     return results

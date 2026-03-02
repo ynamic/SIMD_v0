@@ -134,29 +134,29 @@ class TestConditional(unittest.TestCase):
 
 
 class TestMatrix(unittest.TestCase):
-    """矩阵运算向量化测试"""
+    """矩阵运算测试（innermost-only 下当前为跳过行为）"""
 
     @classmethod
     def setUpClass(cls):
         cls.output = _vectorize(str(TESTS_DIR / 'test_matrix.c'))
 
-    def test_has_svmla_f32(self):
-        self.assertIn('svmla_f32_x', self.output, '缺少 svmla_f32_x（FMA乘加）')
+    def test_matrix_is_skipped(self):
+        self.assertIn('SVE-VECTORIZER: SKIPPED', self.output, '矩阵循环应被标记为跳过')
 
-    def test_has_svdup_f32(self):
-        self.assertIn('svdup_f32', self.output, '缺少 svdup_f32（标量广播）')
+    def test_has_skip_line7(self):
+        self.assertIn('SKIPPED (line 7)', self.output, '缺少对 matmul 内层循环的跳过标记')
 
-    def test_has_svld1_f32(self):
-        self.assertIn('svld1_f32', self.output, '缺少 svld1_f32（矩阵元素加载）')
+    def test_has_skip_line17(self):
+        self.assertIn('SKIPPED (line 17)', self.output, '缺少对 matvec 内层循环的跳过标记')
 
-    def test_has_svst1_f32(self):
-        self.assertIn('svst1_f32', self.output, '缺少 svst1_f32（矩阵元素存储）')
+    def test_keeps_original_loop(self):
+        self.assertIn('for (int j = 0; j < N; j++)', self.output, '跳过后应保留原始内层循环')
 
-    def test_has_matrix_comment(self):
-        self.assertIn('SVE vectorized: MATRIX', self.output, '缺少矩阵向量化注释')
+    def test_no_matrix_vectorized_comment(self):
+        self.assertNotIn('SVE vectorized: MATRIX', self.output, 'innermost-only 下不应走顶层矩阵模板')
 
-    def test_has_j_loop_vectorized(self):
-        self.assertIn('j-loop vectorized', self.output, '缺少 j 循环向量化说明')
+    def test_no_j_loop_vectorized_comment(self):
+        self.assertNotIn('j-loop vectorized', self.output, 'innermost-only 下不应出现 j-loop vectorized 注释')
 
 
 class TestHeaders(unittest.TestCase):

@@ -73,7 +73,7 @@ class SVEVectorizer:
             return False
 
         if self.verbose:
-            print(f'[信息] 发现 {len(loops)} 个顶层 for 循环')
+            print(f'[信息] 解析得到 {len(loops)} 个 for 循环（含嵌套）')
 
         if save_stages:
             self._save_stage1(loops, stem)
@@ -86,6 +86,9 @@ class SVEVectorizer:
 
         # 3. 分析循环
         analyzed: List[AnalyzedLoop] = analyze_loops(loops)
+
+        if self.verbose:
+            print(f'[信息] 选择最内层循环进行向量化，共 {len(analyzed)} 个')
 
         if self.verbose:
             for al in analyzed:
@@ -153,23 +156,32 @@ class SVEVectorizer:
         """
         将 SVE 代码片段按行号替换原始循环代码。
         关键：按 node_coord_start 降序处理，避免行号偏移问题。
-        只替换顶层循环（nesting_level == 0）。
+        analyzed_loops 为最内层循环集合。
         """
         # 构建替换任务列表，按起始行降序排列
         tasks: List[Tuple[int, int, str]] = []
         for al, snippet in zip(analyzed_loops, snippets):
             orig = al.original
-            if orig.nesting_level != 0:
-                continue
             start = orig.node_coord_start - 1  # 转为 0-based 索引
             end = orig.node_coord_end           # 0-based exclusive（即 source_lines[start:end]）
             tasks.append((start, end, snippet))
 
+        if not tasks:
+            return list(source_lines)
+
+        # 去重/防重叠：优先保留更内层（区间更短）的循环
+        tasks.sort(key=lambda t: ((t[1] - t[0]), -t[0]))
+        selected: List[Tuple[int, int, str]] = []
+        for start, end, snippet in tasks:
+            overlap = any(not (end <= s or start >= e) for s, e, _ in selected)
+            if not overlap:
+                selected.append((start, end, snippet))
+
         # 降序排列
-        tasks.sort(key=lambda t: t[0], reverse=True)
+        selected.sort(key=lambda t: t[0], reverse=True)
 
         result = list(source_lines)
-        for start, end, snippet in tasks:
+        for start, end, snippet in selected:
             # 在替换位置添加原始行号注释 + SVE 代码
             orig_comment = f'/* [SVE-VECTORIZER] 原始循环位于第 {start + 1} 行 */\n'
             new_block = [orig_comment + snippet + '\n']

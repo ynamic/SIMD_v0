@@ -118,12 +118,14 @@ def _strip_c_comments(source: str) -> str:
     移除 C 风格注释（/* ... */ 和 // ...），
     用于 use_cpp=False 时让 pycparser 能正常解析。
     """
-    # 同时处理块注释和行注释
-    pattern = re.compile(
-        r'//[^\n]*|/\*.*?\*/',
-        re.DOTALL,
-    )
-    return pattern.sub(' ', source)
+    # 同时处理块注释和行注释；替换时保留换行数量，避免坐标行号漂移
+    pattern = re.compile(r'//[^\n]*|/\*.*?\*/', re.DOTALL)
+
+    def _replacer(match: re.Match) -> str:
+        text = match.group(0)
+        return ''.join('\n' if ch == '\n' else ' ' for ch in text)
+
+    return pattern.sub(_replacer, source)
 
 
 def _get_fake_libc_path() -> str:
@@ -377,8 +379,9 @@ class _BodyAnalyzer:
             return
         if isinstance(node, c_ast.ArrayRef):
             acc = self._parse_array_ref(node, is_write=False)
+            sig = (acc.array_name, tuple(acc.index_vars), acc.index_offset, acc.pattern)
             already = any(
-                r.array_name == acc.array_name and r.index_vars == acc.index_vars
+                (r.array_name, tuple(r.index_vars), r.index_offset, r.pattern) == sig
                 for r in self.array_reads
             )
             if not already:
@@ -629,6 +632,7 @@ def extract_loops(c_file: str, use_cpp: bool = True) -> List[LoopInfo]:
     else:
         # pycparser 不支持注释，先剥离后写入临时文件再解析
         stripped = _strip_c_comments(''.join(source_lines))
+        tmp_path = ''
         try:
             with tempfile.NamedTemporaryFile(
                 mode='w', suffix='.c', delete=False, encoding='utf-8'
@@ -638,6 +642,12 @@ def extract_loops(c_file: str, use_cpp: bool = True) -> List[LoopInfo]:
             ast = parse_file(tmp_path, use_cpp=False)
         except Exception as e:
             raise RuntimeError(f"pycparser 解析失败: {e}") from e
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     extractor = LoopExtractor(source_lines, c_file)
     extractor.visit(ast)

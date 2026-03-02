@@ -294,11 +294,10 @@ AnalyzedLoop
 
 | 优先级 | 模式 | 判断条件 |
 |--------|------|---------|
-| 1 | `MATRIX` | 顶层且含 `inner_loops`，最深层循环的写/读下标含外层循环变量（innermost-only 模式下通常不会触发） |
-| 2 | `REDUCTION` | `is_reduction == True`，存在归约变量 |
-| 3 | `CONDITIONAL` | `has_condition == True`，循环体主体为 `if` 语句 |
-| 4 | `ELEMENTWISE` | 写数组下标只含当前循环变量，无循环携带依赖 |
-| 5 | `UNKNOWN` | 以上均不满足 |
+| 1 | `REDUCTION` | `is_reduction == True`，存在归约变量 |
+| 2 | `CONDITIONAL` | `has_condition == True`，循环体主体为 `if` 语句 |
+| 3 | `ELEMENTWISE` | 写数组下标只含当前循环变量，无循环携带依赖 |
+| 4 | `UNKNOWN` | 以上均不满足 |
 
 #### 可向量化性检查规则
 
@@ -308,7 +307,6 @@ AnalyzedLoop
 | RAW 依赖 | 写 `a[i]` 同时读 `a[i+k]`（k>0） | NOT_VECTORIZABLE |
 | 别名偏移依赖 | 写数组出现在读数组中且有常量偏移 | NOT_VECTORIZABLE |
 | 条件控制依赖 | 条件分支内修改循环控制变量 | NOT_VECTORIZABLE |
-| 矩阵模式 | j 层可向量化，k 层保持标量 | VECTORIZABLE |
 
 #### 类型推断映射
 
@@ -357,7 +355,6 @@ class UnrollConfig:
 | ELEMENTWISE | ≥ 2 | **2** | **开启**，8×vl | 访存密集，预取收益明显 |
 | ELEMENTWISE | = 1 | **2** | 关闭 | 展开提升 ILP，单读无需预取 |
 | REDUCTION | 任意 | **1**（不展开） | 关闭 | 累加器有顺序依赖 |
-| MATRIX | 任意 | **1** | 关闭 | innermost-only 下当前不触发矩阵专用路径 |
 | 其他/不可向量化 | — | **1** | 关闭 | 保守策略 |
 
 CLI 通过 `--unroll N` 和 `--prefetch-dist N` 可强制覆盖自动决策。
@@ -440,7 +437,8 @@ _VEC_TYPE  # 向量类型   svfloat32_t / svfloat64_t / svint32_t ...
 | ELEMENTWISE | `svptrue` + `svld1` + `svadd/sub/mul/div_x` + `svst1` + `svwhilelt`（尾部） | ✅ 三段式 + 展开 + 预取 |
 | REDUCTION | `svdup` + `svld1` + `svadd_m` + `svaddv` + `svwhilelt` | 接口兼容（不展开） |
 | CONDITIONAL | `svwhilelt` + `svld1` + `svcmpXX` + `cond_pg` + `svst1` | — |
-| MATRIX | （模板保留）`svdup` + `svwhilelt` + `svld1` + `svmla_x` + `svst1` | 当前默认流程不触发 |
+
+> 说明：矩阵专用代码生成分支已在当前版本下线，后续将以独立模块形式逐步恢复。
 
 #### 谓词形式选择原则
 
@@ -670,53 +668,22 @@ for (int i = 0; i < n; i++)
 
 ---
 
-### 矩阵运算（MATRIX）
+### 预留扩展：矩阵向量化（未来版本）
 
-> 当前版本已移除顶层循环向量化，默认仅处理最内层循环，因此矩阵专用模板在默认流程中不会触发；当前行为为保守跳过并保留原始循环。
+当前版本中，矩阵专用识别与代码生成模块已下线，默认行为是**保守跳过矩阵类嵌套循环并保留原始代码**。
 
-#### 识别条件
-- 顶层循环含内层循环（`nesting_level=0` 且 `inner_loops` 非空）
-- 最深层循环的写或读下标中含外层循环变量
+为支持后续逐步扩展，当前代码结构仍保留了以下可扩展点：
 
-#### 生成结构（向量化最内层 j 循环）
+- `LoopAnalyzer`：可在模式分类阶段恢复矩阵识别规则；
+- `LoopUnroller`：可新增矩阵场景的展开/预取策略；
+- `SVECodeGen`：可通过独立分发分支接入矩阵模板生成器；
+- `tests/test_matrix.c`：已保留矩阵回归样例，可用于“跳过 → 部分支持 → 完整支持”的阶段验收。
 
-```c
-/* 输入（3 层嵌套矩阵乘法） */
-for (int i = 0; i < M; i++)
-    for (int k = 0; k < K; k++)
-        for (int j = 0; j < N; j++)
-            C[i*N+j] += A[i*K+k] * B[k*N+j];
+建议恢复顺序：
 
-/* 输出（i/k 保持标量，j 向量化） */
-int64_t sve_vl = svcntw();
-svbool_t pg;
-for (int i = 0; i < M; i++) {
-    for (int k = 0; k < K; k++) {
-        svfloat32_t va = svdup_f32(A[i*K+k]);   /* 广播标量 A[i*K+k] */
-        int64_t j = 0;
-        for (; j < (int64_t)N; j += sve_vl) {
-            pg = svwhilelt_b32(j, (int64_t)N);
-            svfloat32_t vb = svld1_f32(pg, &B[k*N+j]);
-            svfloat32_t vc = svld1_f32(pg, &C[i*N+j]);
-            vc = svmla_f32_x(pg, vc, va, vb);   /* vc += va * vb（FMA） */
-            svst1_f32(pg, &C[i*N+j], vc);
-        }
-    }
-}
-```
-
-#### 已支持场景 / 当前缺陷
-
-| 场景 | 状态 |
-|------|------|
-| 3 层嵌套 `C[i*N+j] += A[i*K+k] * B[k*N+j]` | ⚠️ 当前默认跳过（保留原循环） |
-| 2 层嵌套矩阵向量乘 `y[i] += A[i*N+j] * x[j]` | ⚠️ 当前默认跳过（保留原循环） |
-| `a[i][j]` 二维数组写法（vs 平铺 `a[i*N+j]`） | ✅ 两种下标模式均能识别 |
-| 4 层以上嵌套 | ⚠️ 只取最深一层，中间层保持标量；超过 3 层可能识别错误 |
-| 非方阵 / 非标准 i-k-j 循序 | ⚠️ A/B/C 识别依赖下标变量启发式，非 i-k-j 顺序可能错配 |
-| j 循环展开 / 预取 | ⚠️ 未实现，固定单段式 |
-| `C[i][j] += ...`（写为二维数组下标） | ✅ 支持，`_parse_subscript` 能提取 `i`、`j` |
-| 内层循环含 `if` | ⚠️ 内层条件分支不处理 |
+1. 先增强依赖判定与嵌套循环分析（保证正确性）；
+2. 再恢复矩阵模式识别（仅识别，不生成）；
+3. 最后接入矩阵代码生成与性能策略（展开、预取、循环交换）。
 
 ---
 
@@ -975,7 +942,7 @@ cd /path/to/SIMD
 python tests/run_tests.py
 ```
 
-共 **32 个测试**，覆盖 ELEMENTWISE/REDUCTION/CONDITIONAL、矩阵跳过行为、头文件注入、dry-run 模式和报告输出。
+共 **32 个测试**，覆盖 ELEMENTWISE/REDUCTION/CONDITIONAL、矩阵保守跳过行为、头文件注入、dry-run 模式和报告输出。
 
 ### 测试文件说明
 

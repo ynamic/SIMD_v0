@@ -158,12 +158,38 @@ class SVEVectorizer:
         关键：按 node_coord_start 降序处理，避免行号偏移问题。
         analyzed_loops 为最内层循环集合。
         """
+        def _find_for_end(start_idx: int, fallback_end: int) -> int:
+            """根据源码大括号匹配求 for 语句结束位置（0-based exclusive）。"""
+            if start_idx < 0 or start_idx >= len(source_lines):
+                return fallback_end
+
+            brace_depth = 0
+            seen_open_brace = False
+
+            for idx in range(start_idx, len(source_lines)):
+                line = source_lines[idx]
+                for ch in line:
+                    if ch == '{':
+                        brace_depth += 1
+                        seen_open_brace = True
+                    elif ch == '}' and seen_open_brace:
+                        brace_depth -= 1
+                        if brace_depth == 0:
+                            return idx + 1
+
+                # 无花括号的单语句 for（保守处理）
+                if not seen_open_brace and ';' in line and idx > start_idx:
+                    return idx + 1
+
+            return fallback_end
+
         # 构建替换任务列表，按起始行降序排列
         tasks: List[Tuple[int, int, str]] = []
         for al, snippet in zip(analyzed_loops, snippets):
             orig = al.original
             start = orig.node_coord_start - 1  # 转为 0-based 索引
-            end = orig.node_coord_end           # 0-based exclusive（即 source_lines[start:end]）
+            fallback_end = orig.node_coord_end
+            end = _find_for_end(start, fallback_end)
             tasks.append((start, end, snippet))
 
         if not tasks:

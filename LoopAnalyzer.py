@@ -26,7 +26,6 @@ class LoopPattern(Enum):
     ELEMENTWISE  = auto()  # a[i] = b[i] op c[i]
     REDUCTION    = auto()  # sum += a[i]
     CONDITIONAL  = auto()  # if(cond) array_op
-    MATRIX       = auto()  # 嵌套循环矩阵运算
     UNKNOWN      = auto()  # 不支持的模式
 
 
@@ -120,8 +119,6 @@ class LoopAnalyzer:
 
         if dep.has_loop_carried_dep:
             status = VectorizabilityStatus.NOT_VECTORIZABLE
-        elif pattern == LoopPattern.MATRIX:
-            status = VectorizabilityStatus.VECTORIZABLE  # j 层可向量化
         elif pattern == LoopPattern.UNKNOWN:
             status = VectorizabilityStatus.NOT_VECTORIZABLE
         else:
@@ -153,13 +150,8 @@ class LoopAnalyzer:
 
     def _classify_pattern(self, loop: LoopInfo) -> LoopPattern:
         """
-        优先级：MATRIX > REDUCTION > CONDITIONAL > ELEMENTWISE > UNKNOWN
+        优先级：REDUCTION > CONDITIONAL > ELEMENTWISE > UNKNOWN
         """
-        # MATRIX：顶层循环且含内层循环（至少2层嵌套）
-        if loop.nesting_level == 0 and loop.inner_loops:
-            if self._looks_like_matrix(loop):
-                return LoopPattern.MATRIX
-
         # REDUCTION：存在归约变量
         if loop.is_reduction and loop.reduction_var:
             return LoopPattern.REDUCTION
@@ -173,33 +165,6 @@ class LoopAnalyzer:
             return LoopPattern.ELEMENTWISE
 
         return LoopPattern.UNKNOWN
-
-    def _looks_like_matrix(self, loop: LoopInfo) -> bool:
-        """
-        判断是否为矩阵运算模式：
-        - 至少有一个内层循环
-        - 内层最深循环的写操作下标同时含父循环变量
-        """
-        if not loop.inner_loops:
-            return False
-        # 找最深内层循环
-        deepest = self._get_deepest_loop(loop)
-        outer_var = loop.loop_var
-        for aw in deepest.array_writes:
-            # 写下标同时含外层变量 → 矩阵访问特征
-            if outer_var in aw.index_vars:
-                return True
-        # 也检查最深读操作
-        for ar in deepest.array_reads:
-            if outer_var in ar.index_vars:
-                return True
-        return False
-
-    def _get_deepest_loop(self, loop: LoopInfo) -> LoopInfo:
-        """递归找最深的内层循环"""
-        if not loop.inner_loops:
-            return loop
-        return self._get_deepest_loop(loop.inner_loops[-1])
 
     def _looks_like_elementwise(self, loop: LoopInfo) -> bool:
         """
@@ -295,16 +260,6 @@ class LoopAnalyzer:
                         reason=f'条件分支修改循环控制变量 {lv}，无法向量化',
                     )
 
-        # 规则5：MATRIX 模式（本身可向量化 j 层）
-        if pattern == LoopPattern.MATRIX:
-            return DependencyInfo(
-                has_loop_carried_dep=False,
-                dep_type='none',
-                dep_distance=None,
-                dep_arrays=[],
-                reason='矩阵模式：向量化最内层 j 循环，k 循环保持标量',
-            )
-
         return DependencyInfo(
             has_loop_carried_dep=False,
             dep_type='none',
@@ -366,6 +321,7 @@ def analyze_loops(loops: List[LoopInfo]) -> List[AnalyzedLoop]:
     批量分析循环列表，返回 AnalyzedLoop 列表。
     只分析最内层循环（len(inner_loops) == 0）。
     """
+
     def _walk(loop: LoopInfo) -> List[LoopInfo]:
         nodes = [loop]
         for child in loop.inner_loops:
@@ -381,4 +337,5 @@ def analyze_loops(loops: List[LoopInfo]) -> List[AnalyzedLoop]:
     for loop in all_loops:
         if not loop.inner_loops:
             results.append(analyzer.analyze(loop))
+
     return results

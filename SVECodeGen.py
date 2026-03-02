@@ -182,7 +182,6 @@ class SVECodeGen:
             LoopPattern.ELEMENTWISE:  self._gen_elementwise,
             LoopPattern.REDUCTION:    self._gen_reduction,
             LoopPattern.CONDITIONAL:  self._gen_conditional,
-            LoopPattern.MATRIX:       self._gen_matrix,
         }
         gen_fn = dispatch.get(loop.pattern, self._gen_fallback)
         # 将 cfg 传给支持展开的生成函数
@@ -460,131 +459,6 @@ class SVECodeGen:
 
         body.append(_ind('\n'.join(inner)))
         body.append('}')
-        lines.append(_ind('\n'.join(body)))
-        lines.append('}')
-
-        return '\n'.join(lines)
-
-    # ------------------------------------------------------------------ #
-    #  MATRIX: 矩阵乘法，向量化最内层 j 循环                              #
-    # ------------------------------------------------------------------ #
-
-    def _gen_matrix(self, loop: AnalyzedLoop) -> str:
-        orig = loop.original
-        suf = loop.sve_type_suffix
-        vtype = _VEC_TYPE.get(suf, 'svfloat32_t')
-        load_fn = _LOAD.get(suf, 'svld1_f32')
-        store_fn = _STORE.get(suf, 'svst1_f32')
-        dup_fn = _DUP.get(suf, 'svdup_f32')
-        mla_fn = _MLA.get(suf, 'svmla_f32_x')
-        whilelt_fn = _WHILELT.get(loop.whilelt_suffix, 'svwhilelt_b32')
-        vl_hint = loop.vl_hint
-
-        # 从嵌套循环推断矩阵变量名
-        # 典型矩阵：C[i*N+j] += A[i*K+k] * B[k*N+j]
-        # 外层 i 循环 -> loop
-        # 中层 k 循环 -> loop.inner_loops[0]
-        # 内层 j 循环 -> k_loop.inner_loops[0]
-        i_var = orig.loop_var
-        i_end = orig.loop_end
-        i_end_op = orig.loop_end_op
-
-        # 推断矩阵维度变量名
-        k_loop: Optional[LoopInfo] = orig.inner_loops[0] if orig.inner_loops else None
-        j_loop: Optional[LoopInfo] = (k_loop.inner_loops[0]
-                                       if k_loop and k_loop.inner_loops else None)
-
-        if k_loop is None or j_loop is None:
-            return self._gen_fallback(loop)
-
-        k_var = k_loop.loop_var
-        k_end = k_loop.loop_end
-        j_var = j_loop.loop_var
-        j_end = j_loop.loop_end
-
-        j_end_expr = (f'(int64_t)({j_end}) + 1'
-                      if j_loop.loop_end_op == '<=' else f'(int64_t)({j_end})')
-
-        # 尝试从读写访问中识别 A、B、C
-        # C[...] 是写目标，A/B 是读来源
-        write_acc = _get_primary_write(j_loop)
-        read_accs = _get_read_arrays(j_loop, exclude_name=write_acc.array_name if write_acc else None)
-
-        c_name = write_acc.array_name if write_acc else 'C'
-        # 找含有 k_var 下标的读数组（A 或 B）
-        a_acc = next((r for r in read_accs if k_var in r.index_vars
-                      and i_var in r.index_vars), None)
-        b_acc = next((r for r in read_accs if k_var in r.index_vars
-                      and j_var in r.index_vars), None)
-
-        # fallback 名称
-        a_name = a_acc.array_name if a_acc else ('A' if len(read_accs) > 0 else 'A')
-        b_name = b_acc.array_name if b_acc else ('B' if len(read_accs) > 1 else 'B')
-
-        # 推断 K、N 等维度（从读操作下标的常量因子推断，保守处理）
-        # 直接使用循环变量端点作为维度变量名
-        k_dim = k_end    # K
-        j_dim = j_end    # N
-        i_dim = i_end    # M
-
-        lines: List[str] = []
-        lines.append(f'/* SVE vectorized: MATRIX MUL {loop.sve_element_type} (j-loop vectorized) */\n{{')
-
-        body = []
-        body.append(f'int64_t sve_vl = {vl_hint};')
-        body.append(f'svbool_t pg;')
-
-        # i 循环（标量）
-        i_end_cmp = f'{i_dim}' if i_end_op != '<=' else f'(int64_t)({i_dim}) + 1'
-        body.append(f'for (int {i_var} = 0; {i_var} < {i_end_cmp}; {i_var}++) {{')
-
-        i_inner = []
-        # k 循环（标量）
-        k_end_cmp = f'{k_dim}' if k_loop.loop_end_op != '<=' else f'(int64_t)({k_dim}) + 1'
-        i_inner.append(f'for (int {k_var} = 0; {k_var} < {k_end_cmp}; {k_var}++) {{')
-
-        k_inner = []
-        # 广播 A[i*K+k] 为标量 → 向量
-        # 从 a_acc 推断实际的索引表达式
-        if a_acc and a_acc.pattern == a_acc.pattern.INDEXED_2D:
-            # a[i][k] 形式
-            k_inner.append(f'{vtype} va = {dup_fn}({a_name}[{i_var}][{k_var}]);')
-        else:
-            # a[i*K+k] 形式（平铺数组）
-            k_inner.append(f'{vtype} va = {dup_fn}({a_name}[{i_var}*{k_dim}+{k_var}]);')
-
-        # j 循环（向量化）
-        k_inner.append(f'int64_t {j_var} = 0;')
-        k_inner.append(f'for (; {j_var} < {j_end_expr}; {j_var} += sve_vl) {{')
-
-        j_inner = []
-        j_inner.append(f'pg = {whilelt_fn}({j_var}, {j_end_expr});')
-
-        # 加载 B[k*N+j] / B[k][j]
-        if b_acc and b_acc.pattern == b_acc.pattern.INDEXED_2D:
-            j_inner.append(f'{vtype} vb = {load_fn}(pg, &{b_name}[{k_var}][{j_var}]);')
-        else:
-            j_inner.append(f'{vtype} vb = {load_fn}(pg, &{b_name}[{k_var}*{j_dim}+{j_var}]);')
-
-        # 加载 C[i*N+j] / C[i][j]
-        if write_acc and write_acc.pattern == write_acc.pattern.INDEXED_2D:
-            j_inner.append(f'{vtype} vc = {load_fn}(pg, &{c_name}[{i_var}][{j_var}]);')
-            j_inner.append(f'vc = {mla_fn}(pg, vc, va, vb);  /* vc += va * vb */')
-            j_inner.append(f'{store_fn}(pg, &{c_name}[{i_var}][{j_var}], vc);')
-        else:
-            j_inner.append(f'{vtype} vc = {load_fn}(pg, &{c_name}[{i_var}*{j_dim}+{j_var}]);')
-            j_inner.append(f'vc = {mla_fn}(pg, vc, va, vb);  /* vc += va * vb */')
-            j_inner.append(f'{store_fn}(pg, &{c_name}[{i_var}*{j_dim}+{j_var}], vc);')
-
-        k_inner.append(_ind('\n'.join(j_inner), 1))
-        k_inner.append('}  /* j loop end */')
-
-        i_inner.append(_ind('\n'.join(k_inner), 1))
-        i_inner.append('}  /* k loop end */')
-
-        body.append(_ind('\n'.join(i_inner), 1))
-        body.append('}  /* i loop end */')
-
         lines.append(_ind('\n'.join(body)))
         lines.append('}')
 

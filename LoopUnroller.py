@@ -57,11 +57,10 @@ class UnrollConfig:
 # 规则优先级（从高到低）：
 #   1. 不可向量化的循环 → unroll_factor=1, enable_prefetch=False（后续由 fallback 处理）
 #   2. REDUCTION → unroll_factor=1（归约累加器有顺序依赖，不展开以保证 _m 语义）
-#   3. MATRIX    → unroll_factor=2（向量化 j 循环，展开 2 份提升 ILP）
-#   4. ELEMENTWISE，读数组 ≥ 2 → unroll_factor=2, enable_prefetch=True
+#   3. ELEMENTWISE，读数组 ≥ 2 → unroll_factor=2, enable_prefetch=True
 #      （典型 a[i]=b[i]+c[i]，访存密集，预取收益明显）
-#   5. ELEMENTWISE，读数组 == 1（纯赋值/单操作数）→ unroll_factor=2, enable_prefetch=False
-#   6. 其他 VECTORIZABLE → unroll_factor=1
+#   4. ELEMENTWISE，读数组 == 1（纯赋值/单操作数）→ unroll_factor=2, enable_prefetch=False
+#   5. 其他 VECTORIZABLE → unroll_factor=1
 
 _DEFAULT_PREFETCH_DIST = 8   # 默认 8*vl 预取距离
 
@@ -85,14 +84,6 @@ def _decide(loop: AnalyzedLoop) -> UnrollConfig:
             unroll_factor=1,
             enable_prefetch=False,
             reason='REDUCTION：累加器有序依赖，不展开',
-        )
-
-    if pattern == LoopPattern.MATRIX:
-        return UnrollConfig(
-            unroll_factor=2,
-            enable_prefetch=True,
-            prefetch_dist=_DEFAULT_PREFETCH_DIST,
-            reason='MATRIX：内层 j 循环展开 2 份，开启预取',
         )
 
     if pattern == LoopPattern.ELEMENTWISE:

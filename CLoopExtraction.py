@@ -416,6 +416,10 @@ class _BodyAnalyzer:
         result = []
         if isinstance(node, c_ast.Assignment):
             result.append(f'{_node_to_str(node.lvalue)} {node.op} {_node_to_str(node.rvalue)}')
+        elif isinstance(node, c_ast.UnaryOp):
+            # 捕获 i++、++i、i--、--i 等递增/递减操作
+            if node.op in ('p++', 'p--', '++', '--') and isinstance(node.expr, c_ast.ID):
+                result.append(f'{node.expr.name} {node.op}')
         elif isinstance(node, c_ast.Compound):
             for _, child in node.children():
                 result.extend(self._describe_stmt(child))

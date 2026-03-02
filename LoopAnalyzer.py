@@ -209,17 +209,17 @@ class LoopAnalyzer:
                 reason=f'非单位步长（step={loop.loop_step}），暂不支持向量化',
             )
 
-        # 规则2：RAW 依赖检测（a[i] 写 + a[i+k] 读，k>0）
+        # 规则2：WAR 依赖检测（a[i] 写 + a[i+k] 读，k>0：先读后写）
         write_names = {aw.array_name for aw in loop.array_writes}
         for ar in loop.array_reads:
             if ar.array_name in write_names and ar.index_offset > 0:
                 return DependencyInfo(
                     has_loop_carried_dep=True,
-                    dep_type='RAW',
+                    dep_type='WAR',
                     dep_distance=ar.index_offset,
                     dep_arrays=[ar.array_name],
                     reason=(
-                        f'数组 {ar.array_name} 存在循环携带 RAW 依赖'
+                        f'数组 {ar.array_name} 存在循环携带 WAR 依赖'
                         f'（读 offset={ar.index_offset}）'
                     ),
                 )
@@ -234,10 +234,12 @@ class LoopAnalyzer:
                     # 检查是否有偏移读
                     for ar in loop.array_reads:
                         if ar.array_name == aw.array_name and ar.index_offset != 0:
+                            # 正偏移（读后方元素）：WAR；负偏移（读前方元素）：RAW
+                            dep_type = 'WAR' if ar.index_offset > 0 else 'RAW'
                             return DependencyInfo(
                                 has_loop_carried_dep=True,
-                                dep_type='WAR',
-                                dep_distance=ar.index_offset,
+                                dep_type=dep_type,
+                                dep_distance=abs(ar.index_offset),
                                 dep_arrays=[aw.array_name],
                                 reason=(
                                     f'数组 {aw.array_name} 存在别名依赖'
@@ -299,12 +301,25 @@ class LoopAnalyzer:
             return DataType.UNKNOWN
         # 去掉指针符，取基础类型
         base = raw.rstrip('*').strip()
+        # 去掉常见 C 类型修饰符（const / volatile / restrict 等变体）
+        # 通过逐词过滤，避免对类型名称本身的误替换
+        _QUALIFIERS = frozenset({'const', 'volatile', 'restrict', '__restrict__', '__restrict'})
+        tokens = [t for t in base.split() if t not in _QUALIFIERS]
+        base = ' '.join(tokens)
         return _TYPE_MAP.get(base, DataType.UNKNOWN)
 
     # ---- 归约初始值推断 ----
 
     def _infer_reduction_init(self, loop: LoopInfo, dt: DataType) -> str:
-        """根据数据类型返回合适的归约初始值字符串"""
+        """根据数据类型和归约算子返回合适的归约初始值字符串"""
+        op = loop.reduction_op or loop.body_operator
+        if op == OperatorKind.MUL:
+            if dt == DataType.FLOAT32:
+                return '1.0f'
+            if dt == DataType.FLOAT64:
+                return '1.0'
+            return '1'
+        # 加法/减法/其他：加法幺元 0
         if dt in (DataType.FLOAT32,):
             return '0.0f'
         if dt in (DataType.FLOAT64,):
